@@ -1,0 +1,149 @@
+{
+    "_api_section": {
+        "description": "═══════════════ 🔌 NapCat API 配置 ═══════════════",
+        "type": "string",
+        "hint": "以下配置用于连接 NapCat 服务，确保 API 地址和 Token 正确",
+        "default": "--- NapCat API 配置区 ---"
+    },
+    "napcat_api_base_url": {
+        "description": "NapCat API 地址",
+        "type": "string",
+        "hint": "NapCat 服务的 API 基础 URL，例如 http://napcat:3000",
+        "default": "http://napcat:3000"
+    },
+    "napcat_token": {
+        "description": "NapCat API Token",
+        "type": "string",
+        "hint": "NapCat 服务的访问令牌（如果配置了的话）。支持环境变量，格式：${ENV_VAR}",
+        "default": "在napcat的网络配置里面你自己看"
+    },
+    "api_retry_attempts": {
+        "description": "API 重试次数",
+        "type": "int",
+        "hint": "NapCat API 调用失败时的最大重试次数",
+        "default": 3
+    },
+    "_vote_basic_section": {
+        "description": "═══════════════ 🗳️ 投票基础配置 ═══════════════",
+        "type": "string",
+        "hint": "以下是投票行为和时长的核心配置",
+        "default": "--- 投票基础配置区 ---"
+    },
+    "vote_duration": {
+        "description": "投票持续时间（秒）",
+        "type": "int",
+        "hint": "投票开始后持续的时间，单位：秒",
+        "default": 60
+    },
+    "ban_duration": {
+        "description": "禁言时长（分钟）",
+        "type": "int",
+        "hint": "投票通过后，对被举报者的禁言时长，单位：分钟",
+        "default": 10
+    },
+    "action_type": {
+        "description": "默认操作类型",
+        "type": "string",
+        "hint": "投票通过后的默认操作",
+        "options": ["ban", "kick"],
+        "default": "ban"
+    },
+    "_threshold_section": {
+        "description": "═══════════════ 📊 投票阈值配置 ═══════════════",
+        "type": "string",
+        "hint": "控制投票通过所需的最低支持票数",
+        "default": "--- 投票阈值配置区 ---"
+    },
+    "enable_percentage_mode": {
+        "description": "启用百分比模式",
+        "type": "bool",
+        "hint": "开启后，所需支持票数将按群成员总数的一定百分比计算。关闭则使用下方的固定票数。",
+        "default": false
+    },
+    "default_required_votes": {
+        "description": "固定所需支持票数",
+        "type": "int",
+        "hint": "当「启用百分比模式」关闭时，投票通过所需的最低支持票数。",
+        "default": 5
+    },
+    "vote_threshold_percent": {
+        "description": "百分比阈值（%）",
+        "type": "float",
+        "hint": "当「启用百分比模式」开启时，所需票数 = 群成员数 × 该百分比。例如填 10 表示 10%。",
+        "default": 10.0
+    },
+    "min_required_votes": {
+        "description": "最少所需支持票数（百分比模式保底）",
+        "type": "int",
+        "hint": "百分比模式下，如果计算出的票数小于该值，则使用该值作为保底门槛。",
+        "default": 3
+    },
+    "_keyword_section": {
+        "description": "═══════════════ 🔑 投票关键词配置 ═══════════════",
+        "type": "string",
+        "hint": "群员发送包含以下关键词的消息即视为投票",
+        "default": "--- 投票关键词配置区 ---"
+    },
+    "yes_keywords": {
+        "description": "支持票关键词",
+        "type": "list",
+        "hint": "群员发送包含这些关键词的消息即视为投支持票",
+        "default": ["支持", "同意", "赞成", "yes", "y"]
+    },
+    "no_keywords": {
+        "description": "反对票关键词",
+        "type": "list",
+        "hint": "群员发送包含这些关键词的消息即视为投反对票",
+        "default": ["反对", "拒绝", "no", "n"]
+    },
+    "_llm_section": {
+        "description": "═══════════════ 🤖 大模型评价配置 ═══════════════",
+        "type": "string",
+        "hint": "使用大语言模型对被举报者进行智能评价",
+        "default": "--- 大模型评价配置区 ---"
+    },
+    "LLM_Evaluation": {
+        "description": "大模型评价设置",
+        "type": "object",
+        "hint": "配置用于生成综合评价的 AI 模型",
+        "items": {
+            "enable_llm_evaluation": {
+                "description": "启用大模型综合评价",
+                "type": "bool",
+                "hint": "是否使用大语言模型生成综合评价",
+                "default": false
+            },
+            "llm_evaluation_provider": {
+                "description": "评价模型提供商",
+                "type": "string",
+                "hint": "选择用于生成综合评价的 AI 提供商。留空则使用当前会话默认提供商。",
+                "default": "",
+                "_special": "select_provider"
+            },
+            "history_count": {
+                "description": "检索发言条数",
+                "type": "int",
+                "hint": "从群聊中检索被举报者的最近发言数量",
+                "default": 20
+            }
+        }
+    },
+    "_interaction_section": {
+        "description": "═══════════════ 💬 交互增强配置 ═══════════════",
+        "type": "string",
+        "hint": "提升举报交互体验的功能配置",
+        "default": "--- 交互增强配置区 ---"
+    },
+    "enable_reason_input": {
+        "description": "启用举报理由输入",
+        "type": "bool",
+        "hint": "开启后，用户发起举报时，Bot 会先询问举报理由，用户回复后再进行后续流程。",
+        "default": false
+    },
+    "reason_timeout": {
+        "description": "举报理由输入超时（秒）",
+        "type": "int",
+        "hint": "等待用户输入举报理由的超时时间。超时后自动取消举报。",
+        "default": 30
+    }
+}
