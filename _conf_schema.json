@@ -23,6 +23,7 @@
         "hint": "NapCat API 调用失败时的最大重试次数",
         "default": 3
     },
+
     "_vote_basic_section": {
         "description": "═══════════════ 🗳️ 投票基础配置 ═══════════════",
         "type": "string",
@@ -48,6 +49,7 @@
         "options": ["ban", "kick"],
         "default": "ban"
     },
+
     "_threshold_section": {
         "description": "═══════════════ 📊 投票阈值配置 ═══════════════",
         "type": "string",
@@ -78,6 +80,7 @@
         "hint": "百分比模式下，如果计算出的票数小于该值，则使用该值作为保底门槛。",
         "default": 3
     },
+
     "_keyword_section": {
         "description": "═══════════════ 🔑 投票关键词配置 ═══════════════",
         "type": "string",
@@ -96,6 +99,7 @@
         "hint": "群员发送包含这些关键词的消息即视为投反对票",
         "default": ["反对", "拒绝", "no", "n"]
     },
+
     "_llm_section": {
         "description": "═══════════════ 🤖 大模型评价配置 ═══════════════",
         "type": "string",
@@ -128,6 +132,7 @@
             }
         }
     },
+
     "_interaction_section": {
         "description": "═══════════════ 💬 交互增强配置 ═══════════════",
         "type": "string",
@@ -145,5 +150,49 @@
         "type": "int",
         "hint": "等待用户输入举报理由的超时时间。超时后自动取消举报。",
         "default": 30
+    },
+
+    "_reminder_section": {
+        "description": "═══════════════ ⏰ 投票提醒配置 ═══════════════",
+        "type": "string",
+        "hint": "控制投票过程中的提醒功能",
+        "default": "--- 投票提醒配置区 ---"
+    },
+    "enable_countdown_reminder": {
+        "description": "启用倒计时提醒",
+        "type": "bool",
+        "hint": "开启后，在投票结束前指定秒数发送一次提醒消息。",
+        "default": false
+    },
+    "countdown_reminder_seconds": {
+        "description": "倒计时提醒提前秒数",
+        "type": "int",
+        "hint": "在投票结束前多少秒发送提醒。例如设为 10，则在结束前 10 秒提醒。",
+        "default": 10
+    },
+    "enable_custom_closing_message": {
+        "description": "启用自定义结束语",
+        "type": "bool",
+        "hint": "开启后，在投票结束时额外发送一条自定义消息。",
+        "default": false
+    },
+    "custom_closing_message": {
+        "description": "自定义结束语内容",
+        "type": "text",
+        "hint": "投票结束时发送的额外消息内容。支持换行。",
+        "default": "投票已结束，感谢大家的参与！"
+    },
+
+    "_blacklist_section": {
+        "description": "═══════════════ 🚫 投票黑名单 ═══════════════",
+        "type": "string",
+        "hint": "配置投票功能的黑名单",
+        "default": "--- 投票黑名单区 ---"
+    },
+    "vote_blacklist": {
+        "description": "投票黑名单",
+        "type": "list",
+        "hint": "黑名单内的用户不能发起举报，也不能被举报。每项为一个 QQ 号。",
+        "default": []
     }
 }
