@@ -1,11 +1,11 @@
 """
 AstrBot 投票禁言插件 (astrbot_plugin_vote_ban)
-版本：3.5.0
-- 新增：投票倒计时提醒
-- 新增：自定义投票结束语
-- 新增：投票历史记录（自动保存到 data/vote_history.json）
-- 新增：投票黑名单
-- 修复：防御性编程改进，过滤机器人自身消息
+版本：3.6.0 fix-final
+- 新增：任何群消息触发全群刷屏扫描，彻底清除残留
+- 新增：严重刷屏快速禁言阈值保护
+- 优化：小批次并发撤回，速度提升且避免限流
+- 保留：分群启用、超级管理员、投票、LLM评价等全部功能
+- 修正：防刷屏扫描队列保留问题，确保跨周期累计可触发快速禁言
 """
 
 import asyncio
@@ -15,7 +15,7 @@ import re
 import os
 import json
 from typing import Dict, Optional, List, Any, Set, Tuple, AsyncGenerator, TypedDict
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 
 import aiohttp
@@ -141,7 +141,7 @@ class VoteSession(TypedDict):
     no_set: Set[str]
     yes_cnt: int
     no_cnt: int
-    state: str  # "voting", "finished", "executed"
+    state: str
     started_at: float
     required_votes: int
     settings: dict
@@ -153,7 +153,7 @@ class VoteSession(TypedDict):
 # 主插件类
 # ============================================================================
 
-@register("astrbot_plugin_vote_ban", "一枝茶狐吖", "投票禁言插件", "3.5.0")
+@register("astrbot_plugin_vote_ban", "一枝茶狐吖", "投票禁言插件", "3.6.0")
 class VoteBanPlugin(Star):
 
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -170,9 +170,12 @@ class VoteBanPlugin(Star):
         self._busy_groups: Set[str] = set()
         self._group_guard = asyncio.Lock()
 
+        # 指纹去重锁
+        self._fingerprint_lock = asyncio.Lock()
         self._seen_msg_ids: Dict[str, float] = {}
 
-        # 历史记录路径
+        # 投票历史写入锁
+        self._history_lock = asyncio.Lock()
         self._history_file = Path("data/vote_history.json")
         self._ensure_history_file()
 
@@ -182,13 +185,23 @@ class VoteBanPlugin(Star):
         else:
             logger.debug("🖥️ 运行在标准/容器环境")
 
-        asyncio.create_task(self._cleanup_finished_sessions())
+        # 防刷屏上下文缓存：每个群一个固定大小队列
+        self.context_messages: Dict[str, deque] = {}
+        self._context_lock = asyncio.Lock()
+
+        # 扫描任务防抖
+        self._scan_tasks: Dict[str, asyncio.Task] = {}
+        self._scan_lock = asyncio.Lock()
+
+        # 后台任务引用，用于卸载时取消
+        self._vote_tasks: Dict[str, asyncio.Task] = {}
+        self._cleanup_task = asyncio.create_task(self._cleanup_finished_sessions())
+
         self._check_critical_config()
 
-        logger.info("投票禁言插件 v3.5.0 已加载")
+        logger.info("投票禁言插件 v3.6.0 (扫描增强版) 已加载")
 
     def _ensure_history_file(self):
-        """确保历史记录文件存在"""
         try:
             self._history_file.parent.mkdir(parents=True, exist_ok=True)
             if not self._history_file.exists():
@@ -197,44 +210,43 @@ class VoteBanPlugin(Star):
         except Exception as e:
             logger.error(f"创建历史记录文件失败: {e}")
 
-    def _save_vote_history(self, sess: VoteSession, passed: bool):
-        """保存投票历史记录"""
-        try:
-            with open(self._history_file, "r", encoding="utf-8") as f:
-                history = json.load(f)
-        except Exception:
-            history = []
+    async def _save_vote_history(self, sess: VoteSession, passed: bool):
+        async with self._history_lock:
+            try:
+                with open(self._history_file, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+            except Exception:
+                history = []
 
-        record = {
-            "vote_id": sess["vote_id"],
-            "group_id": sess["group_id"],
-            "target_qq": sess["target_qq"],
-            "target_name": sess["target_name"],
-            "reporter_name": sess["reporter_name"],
-            "reason": sess.get("reason", ""),
-            "yes_count": sess["yes_cnt"],
-            "no_count": sess["no_cnt"],
-            "required_votes": sess["required_votes"],
-            "passed": passed,
-            "action": sess["settings"]["action"],
-            "ban_minutes": sess["settings"]["ban_min"] if sess["settings"]["action"] == "ban" else 0,
-            "started_at": sess["started_at"],
-            "ended_at": sess.get("ended_at", time.time()),
-            "yes_voters": list(sess["yes_set"]),
-            "no_voters": list(sess["no_set"]),
-        }
-        history.append(record)
+            record = {
+                "vote_id": sess["vote_id"],
+                "group_id": sess["group_id"],
+                "target_qq": sess["target_qq"],
+                "target_name": sess["target_name"],
+                "reporter_name": sess["reporter_name"],
+                "reason": sess.get("reason", ""),
+                "yes_count": sess["yes_cnt"],
+                "no_count": sess["no_cnt"],
+                "required_votes": sess["required_votes"],
+                "passed": passed,
+                "action": sess["settings"]["action"],
+                "ban_minutes": sess["settings"]["ban_min"] if sess["settings"]["action"] == "ban" else 0,
+                "started_at": sess["started_at"],
+                "ended_at": sess.get("ended_at", time.time()),
+                "yes_voters": list(sess["yes_set"]),
+                "no_voters": list(sess["no_set"]),
+            }
+            history.append(record)
 
-        # 保留最近 500 条记录
-        if len(history) > 500:
-            history = history[-500:]
+            if len(history) > 500:
+                history = history[-500:]
 
-        try:
-            with open(self._history_file, "w", encoding="utf-8") as f:
-                json.dump(history, f, ensure_ascii=False, indent=2)
-            logger.debug(f"投票历史已保存，当前共 {len(history)} 条记录")
-        except Exception as e:
-            logger.error(f"保存投票历史失败: {e}")
+            try:
+                with open(self._history_file, "w", encoding="utf-8") as f:
+                    json.dump(history, f, ensure_ascii=False, indent=2)
+                logger.debug(f"投票历史已保存，当前共 {len(history)} 条记录")
+            except Exception as e:
+                logger.error(f"保存投票历史失败: {e}")
 
     def _check_critical_config(self):
         s = self._load_settings()
@@ -252,7 +264,7 @@ class VoteBanPlugin(Star):
             logger.info("💡 请在插件配置页面完成必要设置，详见 README.md")
 
     # ========================================================================
-    # 配置读取（带缓存）
+    # 配置读取（带缓存，包含新增的快速禁言阈值）
     # ========================================================================
 
     def _load_settings(self) -> dict:
@@ -270,29 +282,631 @@ class VoteBanPlugin(Star):
                 "vote_sec": self.config.get("vote_duration", 60),
                 "ban_min": self.config.get("ban_duration", 10),
                 "action": self.config.get("action_type", "ban"),
+                "retries": self.config.get("api_retry_attempts", 3),
+
                 "percent_mode": self.config.get("enable_percentage_mode", False),
                 "fixed_votes": self.config.get("default_required_votes", 5),
                 "percent_val": self.config.get("vote_threshold_percent", 10.0),
                 "min_votes": self.config.get("min_required_votes", 3),
+
                 "yes_words": self.config.get("yes_keywords", ["支持", "同意", "赞成", "yes", "y"]),
                 "no_words": self.config.get("no_keywords", ["反对", "拒绝", "no", "n"]),
-                "retries": self.config.get("api_retry_attempts", 3),
+
                 "ask_reason": self.config.get("enable_reason_input", False),
                 "reason_sec": self.config.get("reason_timeout", 30),
+
                 "llm_on": llm_block.get("enable_llm_evaluation", False),
                 "llm_provider": llm_block.get("llm_evaluation_provider", ""),
                 "history_cnt": llm_block.get("history_count", 20),
+
                 "enable_countdown": self.config.get("enable_countdown_reminder", False),
                 "countdown_sec": self.config.get("countdown_reminder_seconds", 10),
                 "enable_closing_msg": self.config.get("enable_custom_closing_message", False),
                 "closing_msg": self.config.get("custom_closing_message", "投票已结束，感谢大家的参与！"),
+
                 "blacklist": set(str(x) for x in self.config.get("vote_blacklist", [])),
+
+                "enable_group_filter": self.config.get("enable_group_filter", False),
+                "group_enabled_list": self.config.get("group_enabled_list", []),
+                "group_disabled_list": self.config.get("group_disabled_list", []),
+
+                "enable_super_admin": self.config.get("enable_super_admin", False),
+                "super_admin_list": [str(x) for x in self.config.get("super_admin_list", [])],
+
+                # 防刷屏配置
+                "enable_anti_spam": self.config.get("enable_anti_spam", False),
+                "spam_keep_count": self.config.get("spam_keep_count", 1),
+                "spam_context_limit": self.config.get("spam_context_limit", 100),
+                "spam_min_duplicate": self.config.get("spam_min_duplicate", 2),
+                "spam_action": self.config.get("spam_action", "delete_msg"),
+                "spam_rapid_ban_threshold": self.config.get("spam_rapid_ban_threshold", 15),
+                "spam_rapid_ban_duration": self.config.get("spam_rapid_ban_duration", 1),
             }
             self._cache_ts = now
         return self._cached_settings
 
+    # ========================================================================
+    # 分群启用判断
+    # ========================================================================
+
+    def _is_group_enabled(self, group_id: str) -> bool:
+        s = self._load_settings()
+        if not s.get("enable_group_filter", False):
+            return True
+        enabled_list = [str(g) for g in s.get("group_enabled_list", [])]
+        disabled_list = [str(g) for g in s.get("group_disabled_list", [])]
+        gid = str(group_id)
+        if enabled_list:
+            return gid in enabled_list
+        elif disabled_list:
+            return gid not in disabled_list
+        else:
+            return True
+
+    # ========================================================================
+    # 超级管理员判断
+    # ========================================================================
+
+    def _is_super_admin(self, user_id: str) -> bool:
+        s = self._load_settings()
+        if not s.get("enable_super_admin", False):
+            return False
+        super_admins = s.get("super_admin_list", [])
+        return str(user_id) in super_admins
+
+    # ========================================================================
+    # 撤回消息辅助
+    # ========================================================================
+
+    async def _delete_msg_safe(self, message_id) -> bool:
+        """安全的撤回消息，返回是否成功"""
+        try:
+            s = self._load_settings()
+            base = s["api_base"].rstrip('/')
+            token = s["api_token"]
+            url = f"{base}/delete_msg"
+            headers = {"Content-Type": "application/json"}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            payload = {"message_id": int(message_id)}
+            async with (await self._ensure_http()).post(url, headers=headers, json=payload) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("status") == "ok":
+                        return True
+        except (ValueError, TypeError):
+            logger.warning(f"撤回消息失败：无效的 message_id {message_id}")
+        except Exception:
+            pass
+        return False
+
+    # ========================================================================
+    # 防刷屏：扫描调度与执行（修复累计问题，保留队列）
+    # ========================================================================
+
+    async def _schedule_spam_scan(self, group_id: str):
+        """防抖启动扫描：每个群最多每5秒执行一次"""
+        async with self._scan_lock:
+            if group_id in self._scan_tasks and not self._scan_tasks[group_id].done():
+                return
+            self._scan_tasks[group_id] = asyncio.create_task(self._anti_spam_scan(group_id))
+
+    async def _anti_spam_scan(self, group_id: str):
+        """
+        扫描全群聊天记录，清理所有用户的刷屏消息，并执行快速禁言。
+        基于当前消息队列快照统计，跨扫描周期累计。
+        """
+        try:
+            s = self._load_settings()
+            if not s.get("enable_anti_spam", False):
+                return
+
+            keep = s.get("spam_keep_count", 1)
+            min_dup = s.get("spam_min_duplicate", 2)
+            rapid_threshold = s.get("spam_rapid_ban_threshold", 15)
+            rapid_duration = s.get("spam_rapid_ban_duration", 1)
+            base_action = s.get("spam_action", "delete_msg")
+
+            # 获取当前队列的快照（不删除队列）
+            async with self._context_lock:
+                msg_deque = self.context_messages.get(group_id)
+                if not msg_deque:
+                    return
+                # 复制一份列表用于分析，避免长时间占用锁
+                messages = list(msg_deque)
+
+            now = time.time()
+            # 只考虑最近120秒内的消息
+            recent_msgs = [m for m in messages if now - m.get("timestamp", 0) <= 120]
+
+            # 按用户和内容分组
+            user_content_groups: Dict[Tuple[str, str], List[dict]] = {}
+            for msg in recent_msgs:
+                uid = msg["user_id"]
+                content = msg["content"]
+                key = (uid, content)
+                if key not in user_content_groups:
+                    user_content_groups[key] = []
+                user_content_groups[key].append(msg)
+
+            to_ban_users = []          # 需快速禁言的 (uid, duration)
+            to_delete_msgs = []        # 需撤回的消息对象列表
+
+            for (uid, content), msgs in user_content_groups.items():
+                count = len(msgs)
+                if count < min_dup:
+                    continue
+
+                if rapid_threshold > 0 and count >= rapid_threshold:
+                    # 触发快速禁言
+                    logger.info(f"⚡ 快速禁言：用户 {uid} 重复 {count} 次，禁言 {rapid_duration} 分钟")
+                    to_ban_users.append((uid, rapid_duration))
+                    # 将该用户所有此类消息标记为删除（整体清除）
+                    to_delete_msgs.extend(msgs)
+                else:
+                    # 普通处理：保留最新 keep 条，撤回其余
+                    if keep < count:
+                        # 按时间排序（假设队列已大致有序，但还是排一下）
+                        msgs.sort(key=lambda x: x.get("timestamp", 0))
+                        to_delete = msgs[:-keep]
+                        to_delete_msgs.extend(to_delete)
+
+            # 执行快速禁言
+            for uid, dur in to_ban_users:
+                try:
+                    await self._call_api("set_group_ban", group_id=int(group_id),
+                                        user_id=int(uid), duration=dur * 60)
+                    await self._send_group_text(group_id, f"🚫 用户 {uid} 因严重刷屏被禁言 {dur} 分钟。")
+                except Exception as e:
+                    logger.error(f"快速禁言失败: {e}")
+
+            # 并发撤回需要删除的消息（每批8条，间隔0.15秒）
+            if to_delete_msgs:
+                logger.info(f"🧹 扫描清理：群 {group_id}，准备撤回 {len(to_delete_msgs)} 条消息")
+                batch_size = 8
+                # 去重（可能同一消息因分组重复加入？分组不会重复，但保留）
+                unique_msgs = {m["message_id"]: m for m in to_delete_msgs}.values()
+                to_delete_list = list(unique_msgs)
+
+                for i in range(0, len(to_delete_list), batch_size):
+                    batch = to_delete_list[i:i+batch_size]
+                    tasks = [self._delete_msg_safe(m["message_id"]) for m in batch]
+                    await asyncio.gather(*tasks)
+                    await asyncio.sleep(0.15)
+
+                # 从原始队列中移除已撤回的消息，避免下次重复统计
+                async with self._context_lock:
+                    if group_id in self.context_messages:
+                        current_q = self.context_messages[group_id]
+                        removed_ids = {m["message_id"] for m in to_delete_list}
+                        # 重建队列，仅保留未撤回的消息
+                        new_q = deque(
+                            (m for m in current_q if m["message_id"] not in removed_ids),
+                            maxlen=200
+                        )
+                        self.context_messages[group_id] = new_q
+
+                # 附加处罚（ban/kick），避免对已快速禁言的用户重复处罚
+                if base_action in ("ban", "kick"):
+                    handled_users = set(uid for uid, _ in to_ban_users)
+                    # 基于分组再次遍历，但此时只处理未快速禁言且达到阈值的用户
+                    for (uid, _), msgs in user_content_groups.items():
+                        if uid in handled_users:
+                            continue
+                        count = len(msgs)
+                        if count >= min_dup and count < rapid_threshold:
+                            if base_action == "ban":
+                                try:
+                                    ban_dur = s.get("ban_min", 10) * 60
+                                    await self._call_api("set_group_ban", group_id=int(group_id),
+                                                        user_id=int(uid), duration=ban_dur)
+                                    await self._send_group_text(group_id,
+                                        f"🚫 用户 {uid} 因刷屏被禁言 {s.get('ban_min', 10)} 分钟。")
+                                except Exception as e:
+                                    logger.error(f"附加禁言失败: {e}")
+                            elif base_action == "kick":
+                                try:
+                                    await self._call_api("set_group_kick", group_id=int(group_id), user_id=int(uid))
+                                    await self._send_group_text(group_id,
+                                        f"🚫 用户 {uid} 因刷屏被踢出群聊。")
+                                except Exception as e:
+                                    logger.error(f"附加踢出失败: {e}")
+
+        except Exception as e:
+            logger.error(f"防刷屏扫描异常: {e}")
+
+    # ========================================================================
+    # 群消息监听（接入防刷屏扫描）
+    # ========================================================================
+
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def on_group_message(self, event: AstrMessageEvent):
+        group_id = event.message_obj.group_id
+        if not group_id:
+            return
+
+        if not self._is_group_enabled(group_id):
+            return
+
+        if str(event.get_sender_id()) == str(event.get_self_id()):
+            return
+
+        fp = calc_message_fingerprint(event)
+        now = time.time()
+        async with self._fingerprint_lock:
+            if fp in self._seen_msg_ids and now - self._seen_msg_ids[fp] < 10:
+                return
+            self._seen_msg_ids[fp] = now
+            self._seen_msg_ids = {k: v for k, v in self._seen_msg_ids.items() if now - v < 60}
+
+        text = pull_plain_text(event)
+        if text == "[图片]":
+            return
+
+        # 防刷屏：存入消息缓存，并触发扫描
+        if self._load_settings().get("enable_anti_spam", False):
+            user_id = event.get_sender_id()
+            message_id = event.message_obj.message_id
+            if message_id and text:
+                async with self._context_lock:
+                    if group_id not in self.context_messages:
+                        self.context_messages[group_id] = deque(maxlen=200)
+                    self.context_messages[group_id].append({
+                        "user_id": user_id,
+                        "content": text,
+                        "message_id": message_id,
+                        "timestamp": time.time()
+                    })
+                await self._schedule_spam_scan(group_id)
+
+        # 投票相关指令
+        if "查看投票进度" in text:
+            async for res in self.cmd_votestatus(event):
+                yield res
+            return
+        if "查看投票群员" in text:
+            async for res in self.cmd_voters(event):
+                yield res
+            return
+
+        async with self._session_lock:
+            cur = None
+            for v in self.active_sessions.values():
+                if v["group_id"] == group_id and v["state"] == "voting":
+                    cur = v
+                    break
+        if not cur:
+            return
+
+        cfg = cur["settings"]
+        yes_kws = cfg.get("yes_words", ["支持", "同意"])
+        no_kws = cfg.get("no_words", ["反对", "拒绝"])
+        vote = None
+        low = text.lower()
+        for w in yes_kws:
+            if w.lower() in low:
+                vote = "yes"
+                break
+        if not vote:
+            for w in no_kws:
+                if w.lower() in low:
+                    vote = "no"
+                    break
+        if vote:
+            await self._apply_vote(group_id, event.get_sender_id(), vote, cur)
+
+    async def _apply_vote(self, group_id: str, voter: str, side: str, sess: VoteSession):
+        async with self._session_lock:
+            if sess["state"] != "voting":
+                return
+            if voter in sess["yes_set"] or voter in sess["no_set"]:
+                return
+            if side == "yes":
+                sess["yes_set"].add(voter)
+                sess["yes_cnt"] += 1
+            else:
+                sess["no_set"].add(voter)
+                sess["no_cnt"] += 1
+
+    # ========================================================================
+    # 超级管理员指令
+    # ========================================================================
+
+    @filter.command("禁言")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_super_ban(self, event: AstrMessageEvent):
+        group_id = event.message_obj.group_id
+        if not group_id:
+            yield event.plain_result("❌ 该指令仅支持在群聊中使用")
+            return
+        s = self._load_settings()
+        if not s.get("enable_super_admin", False):
+            yield event.plain_result("❌ 超级管理员功能未启用")
+            return
+        _, targets = split_command_and_args(event)
+        if not targets:
+            yield event.plain_result("⚠️ 请使用 /禁言 @用户 [时长分钟]")
+            return
+        target_qq = targets[0]
+        parts = event.message_str.strip().split()
+        duration_min = s.get("ban_min", 10)
+        if len(parts) >= 3:
+            try:
+                duration_min = int(parts[2])
+            except ValueError:
+                pass
+        try:
+            info = await self._call_api("get_group_member_info", group_id=int(group_id), user_id=int(target_qq))
+            target_name = (info.get("card") or info.get("nickname") if info else None) or f"QQ:{target_qq}"
+            await self._call_api("set_group_ban", group_id=int(group_id),
+                                user_id=int(target_qq), duration=duration_min * 60)
+            msg = f"🔨 管理员已对 {target_name}({target_qq}) 禁言 {duration_min} 分钟。"
+            logger.info(f"管理员禁言：群 {group_id} 目标 {target_qq}，时长 {duration_min} 分钟")
+            yield event.plain_result(msg)
+        except Exception as e:
+            logger.error(f"超级管理员禁言失败: {e}")
+            yield event.plain_result(f"❌ 禁言失败：{e}")
+
+    @filter.command("踢人")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_super_kick(self, event: AstrMessageEvent):
+        group_id = event.message_obj.group_id
+        if not group_id:
+            yield event.plain_result("❌ 该指令仅支持在群聊中使用")
+            return
+        s = self._load_settings()
+        if not s.get("enable_super_admin", False):
+            yield event.plain_result("❌ 超级管理员功能未启用")
+            return
+        _, targets = split_command_and_args(event)
+        if not targets:
+            yield event.plain_result("⚠️ 请使用 /踢人 @用户")
+            return
+        target_qq = targets[0]
+        try:
+            info = await self._call_api("get_group_member_info", group_id=int(group_id), user_id=int(target_qq))
+            target_name = (info.get("card") or info.get("nickname") if info else None) or f"QQ:{target_qq}"
+            await self._call_api("set_group_kick", group_id=int(group_id), user_id=int(target_qq))
+            msg = f"👢 管理员已将 {target_name}({target_qq}) 踢出群聊。"
+            logger.info(f"管理员踢人：群 {group_id} 目标 {target_qq}")
+            yield event.plain_result(msg)
+        except Exception as e:
+            logger.error(f"超级管理员踢人失败: {e}")
+            yield event.plain_result(f"❌ 踢人失败：{e}")
+
+    @filter.command("撤回")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_super_delete(self, event: AstrMessageEvent):
+        group_id = event.message_obj.group_id
+        if not group_id:
+            yield event.plain_result("❌ 该指令仅支持在群聊中使用")
+            return
+        s = self._load_settings()
+        if not s.get("enable_super_admin", False):
+            yield event.plain_result("❌ 超级管理员功能未启用")
+            return
+        parts = event.message_str.strip().split()
+        message_id = None
+        if len(parts) >= 2:
+            message_id = parts[1]
+        if not message_id:
+            try:
+                raw_message = event.message_obj.raw_message
+                if isinstance(raw_message, dict):
+                    reply = raw_message.get("reply")
+                    if reply:
+                        message_id = reply.get("message_id") or reply.get("id")
+            except Exception:
+                pass
+        if not message_id:
+            yield event.plain_result("⚠️ 请提供要撤回的消息 ID，或回复目标消息后使用 /撤回")
+            return
+        try:
+            await self._delete_msg_safe(message_id)
+            msg = f"🗑️ 管理员已撤回消息 {message_id}。"
+            logger.info(f"管理员撤回消息：群 {group_id} 消息 {message_id}")
+            yield event.plain_result(msg)
+        except Exception as e:
+            logger.error(f"撤回消息失败: {e}")
+            yield event.plain_result(f"❌ 撤回消息失败：{e}")
+
+    # ========================================================================
+    # 举报指令
+    # ========================================================================
+
+    @filter.command("举报")
+    async def cmd_report(self, event: AstrMessageEvent):
+        group_id = event.message_obj.group_id
+        if not group_id:
+            yield event.plain_result("❌ 该功能仅支持在群聊中使用")
+            return
+
+        if not self._is_group_enabled(group_id):
+            yield event.plain_result("❌ 本群未启用投票功能")
+            return
+
+        _, targets = split_command_and_args(event)
+        if not targets:
+            yield event.plain_result("⚠️ 请使用 /举报 @群友")
+            return
+
+        target_qq = targets[0]
+        reporter_qq = event.get_sender_id()
+        reporter_name = event.get_sender_name()
+        s = self._load_settings()
+
+        if self._is_blacklisted(reporter_qq):
+            yield event.plain_result("🚫 你在投票黑名单中，无法发起举报")
+            return
+        if self._is_blacklisted(target_qq):
+            yield event.plain_result("🚫 目标用户在投票黑名单中，无法被举报")
+            return
+
+        if target_qq == reporter_qq:
+            yield event.plain_result("🤔 不能举报自己哦")
+            return
+
+        async with self._session_lock:
+            for v in self.active_sessions.values():
+                if v["group_id"] == group_id and v["target_qq"] == target_qq and v["state"] == "voting":
+                    yield event.plain_result(f"⏳ 针对 {v['target_name']} 的投票正在进行中")
+                    return
+
+        async with self._group_guard:
+            if group_id in self._busy_groups:
+                yield event.plain_result("⏳ 本群已有投票正在准备中，请稍后再试")
+                return
+            self._busy_groups.add(group_id)
+
+        try:
+            info = await self._call_api("get_group_member_info", group_id=int(group_id), user_id=int(target_qq))
+            if not info:
+                yield event.plain_result("❌ 无法获取被举报用户信息，请检查机器人权限或用户是否在群内")
+                return
+            target_name = (info.get("card") or info.get("nickname") if info else None) or f"QQ:{target_qq}"
+
+            reason = ""
+            if s["ask_reason"]:
+                timeout = s["reason_sec"]
+                yield event.plain_result(f"📝 请在一分钟内发送举报理由（超时自动取消）...")
+
+                @session_waiter(timeout=timeout, record_history_chains=False)
+                async def waiter(ctrl: SessionController, rev: AstrMessageEvent):
+                    nonlocal reason
+                    reason = pull_plain_text(rev)
+                    if not reason:
+                        await rev.send(rev.plain_result("⚠️ 举报理由不能为空，请重新发送"))
+                        ctrl.keep(timeout=timeout, reset_timeout=True)
+                        return
+                    ctrl.stop()
+
+                try:
+                    await waiter(event)
+                except TimeoutError:
+                    yield event.plain_result("⏰ 举报理由输入超时，已取消举报")
+                    return
+                except Exception as e:
+                    yield event.plain_result(f"❌ 发生错误: {e}")
+                    return
+
+                if not reason:
+                    yield event.plain_result("⚠️ 未获取到举报理由，已取消举报")
+                    return
+                yield event.plain_result(f"✅ 收到举报理由：{reason}")
+
+            logger.info(f"群 {group_id} {reporter_name} 举报 {target_name}" + (f"，理由：{reason}" if reason else ""))
+            yield event.plain_result(f"🔍 检测到 {reporter_name} 举报 {target_name}，正在搜索相关信息……")
+            eval_text = await self._evaluate_person(target_qq, target_name, str(group_id), event)
+            yield event.plain_result(eval_text)
+
+            vote_msg = await self._launch_vote(event, group_id, target_qq, target_name, reporter_name, s, reason)
+            yield event.plain_result(vote_msg)
+        finally:
+            async with self._group_guard:
+                self._busy_groups.discard(group_id)
+
+    # ========================================================================
+    # 查询指令
+    # ========================================================================
+
+    async def _find_current_vote(self, group_id: str) -> Optional[VoteSession]:
+        async with self._session_lock:
+            for v in self.active_sessions.values():
+                if v["group_id"] == group_id and v["state"] == "voting":
+                    return v
+            done = [v for v in self.finished_sessions.values() if v["group_id"] == group_id]
+            if done:
+                done.sort(key=lambda x: x.get("ended_at", 0), reverse=True)
+                return done[0]
+            return None
+
+    @filter.command("votestatus")
+    async def cmd_votestatus(self, event: AstrMessageEvent):
+        gid = event.message_obj.group_id
+        if not gid:
+            yield event.plain_result("❌ 该功能仅支持在群聊中使用")
+            return
+        if not self._is_group_enabled(gid):
+            yield event.plain_result("❌ 本群未启用投票功能")
+            return
+        sess = await self._find_current_vote(gid)
+        if not sess:
+            yield event.plain_result("📭 当前没有正在进行的投票，也没有最近结束的投票记录")
+            return
+        if sess["state"] == "voting":
+            left = max(0, sess["settings"]["vote_sec"] - int(time.time() - sess["started_at"]))
+            status = f"进行中，剩余 {left} 秒"
+        else:
+            status = "已结束"
+        reason_line = f"\n举报理由：{sess.get('reason', '无')}" if sess.get("reason") else ""
+        msg = f"""📊 **投票状态**
+
+被举报人：{sess['target_name']}
+举报人：{sess['reporter_name']}{reason_line}
+支持票：{sess['yes_cnt']}/{sess['required_votes']}
+反对票：{sess['no_cnt']}
+状态：{status}
+
+💬 发送 **支持** 或 **反对** 即可投票（仅进行中有效）"""
+        yield event.plain_result(msg)
+
+    @filter.command("voters")
+    async def cmd_voters(self, event: AstrMessageEvent):
+        gid = event.message_obj.group_id
+        if not gid:
+            yield event.plain_result("❌ 该功能仅支持在群聊中使用")
+            return
+        if not self._is_group_enabled(gid):
+            yield event.plain_result("❌ 本群未启用投票功能")
+            return
+        sess = await self._find_current_vote(gid)
+        if not sess:
+            yield event.plain_result("📭 当前没有正在进行的投票，也没有最近结束的投票记录")
+            return
+        yes_list = list(sess["yes_set"])
+        no_list = list(sess["no_set"])
+        status = "进行中" if sess["state"] == "voting" else "已结束"
+        lines = [f"📋 **投票群员名单** ({status})", f"针对：{sess['target_name']}"]
+        if sess.get("reason"):
+            lines.append(f"理由：{sess['reason']}")
+        lines.append(f"✅ 支持 ({len(yes_list)}人): " + (", ".join(yes_list) if yes_list else "暂无"))
+        lines.append(f"❌ 反对 ({len(no_list)}人): " + (", ".join(no_list) if no_list else "暂无"))
+        if sess["state"] == "voting":
+            lines.append(f"\n📊 当前票数: {sess['yes_cnt']}/{sess['required_votes']} (还需 {max(0, sess['required_votes'] - sess['yes_cnt'])} 票)")
+        else:
+            passed = sess["yes_cnt"] >= sess["required_votes"]
+            lines.append(f"\n📊 最终结果: {'✅ 通过' if passed else '❌ 未通过'} (支持 {sess['yes_cnt']}/{sess['required_votes']})")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("setvote")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_setvote(self, event: AstrMessageEvent, vote_sec: int, ban_min: int):
+        self.config["vote_duration"] = vote_sec
+        self.config["ban_duration"] = ban_min
+        self.config.save_config()
+        self._cached_settings = None
+        yield event.plain_result(f"✅ 投票时长已设为 {vote_sec} 秒，禁言时长 {ban_min} 分钟。")
+
+    @filter.command("getvote")
+    async def cmd_getvote(self, event: AstrMessageEvent):
+        s = self._load_settings()
+        gid = event.message_obj.group_id
+        need = await self._calc_needed_votes(str(gid)) if gid else s["fixed_votes"]
+        mode = "百分比模式" if s["percent_mode"] else "固定票数"
+        if s["percent_mode"]:
+            mode += f" ({s['percent_val']}%)"
+        msg = f"📋 当前配置：\n计算方式：{mode}\n投票时长：{s['vote_sec']} 秒\n禁言时长：{s['ban_min']} 分钟\n本群所需票数：{need} 票"
+        yield event.plain_result(msg)
+
+    @filter.command("ping")
+    async def cmd_ping(self, event: AstrMessageEvent):
+        yield event.plain_result("pong! 投票插件 v3.6.0 运行正常")
+
+    # ========================================================================
+    # 原有辅助方法（黑名单、成员数、HTTP、API、发送、LLM等）
+    # ========================================================================
+
     def _is_blacklisted(self, qq: str) -> bool:
-        """检查 QQ 号是否在黑名单中"""
         s = self._load_settings()
         return str(qq) in s["blacklist"]
 
@@ -318,10 +932,6 @@ class VoteBanPlugin(Star):
             return s["fixed_votes"]
         need = int(cnt * s["percent_val"] / 100.0)
         return max(s["min_votes"], need)
-
-    # ========================================================================
-    # HTTP 会话与 API 调用
-    # ========================================================================
 
     async def _ensure_http(self) -> aiohttp.ClientSession:
         if self._http is None or self._http.closed:
@@ -380,10 +990,6 @@ class VoteBanPlugin(Star):
         except Exception as e:
             logger.error(f"发送群消息失败: {e}")
             return False
-
-    # ========================================================================
-    # LLM 评价
-    # ========================================================================
 
     async def _ai_evaluate(self, name: str, msgs: List[str], event: AstrMessageEvent) -> Optional[str]:
         try:
@@ -451,269 +1057,7 @@ class VoteBanPlugin(Star):
         return self._rule_evaluate(name, msgs)
 
     # ========================================================================
-    # 群消息监听
-    # ========================================================================
-
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def on_group_message(self, event: AstrMessageEvent):
-        group_id = event.message_obj.group_id
-        if not group_id:
-            return
-
-        # 过滤机器人自身消息
-        if str(event.get_sender_id()) == str(event.get_self_id()):
-            return
-
-        fp = calc_message_fingerprint(event)
-        now = time.time()
-        if fp in self._seen_msg_ids and now - self._seen_msg_ids[fp] < 10:
-            return
-        self._seen_msg_ids[fp] = now
-        self._seen_msg_ids = {k: v for k, v in self._seen_msg_ids.items() if now - v < 60}
-
-        text = pull_plain_text(event)
-        # 忽略纯图片占位符的误匹配
-        if text == "[图片]":
-            return
-
-        if "查看投票进度" in text:
-            async for res in self.cmd_votestatus(event):
-                yield res
-            return
-        if "查看投票群员" in text:
-            async for res in self.cmd_voters(event):
-                yield res
-            return
-
-        async with self._session_lock:
-            cur = None
-            for v in self.active_sessions.values():
-                if v["group_id"] == group_id and v["state"] == "voting":
-                    cur = v
-                    break
-        if not cur:
-            return
-
-        cfg = cur["settings"]
-        yes_kws = cfg.get("yes_words", ["支持", "同意"])
-        no_kws = cfg.get("no_words", ["反对", "拒绝"])
-        vote = None
-        low = text.lower()
-        for w in yes_kws:
-            if w.lower() in low:
-                vote = "yes"
-                break
-        if not vote:
-            for w in no_kws:
-                if w.lower() in low:
-                    vote = "no"
-                    break
-        if vote:
-            await self._apply_vote(group_id, event.get_sender_id(), vote, cur)
-
-    async def _apply_vote(self, group_id: str, voter: str, side: str, sess: VoteSession):
-        async with self._session_lock:
-            if sess["state"] != "voting":
-                return
-            if voter in sess["yes_set"] or voter in sess["no_set"]:
-                return
-            if side == "yes":
-                sess["yes_set"].add(voter)
-                sess["yes_cnt"] += 1
-            else:
-                sess["no_set"].add(voter)
-                sess["no_cnt"] += 1
-
-    # ========================================================================
-    # 举报指令
-    # ========================================================================
-
-    @filter.command("举报")
-    async def cmd_report(self, event: AstrMessageEvent):
-        group_id = event.message_obj.group_id
-        if not group_id:
-            yield event.plain_result("❌ 该功能仅支持在群聊中使用")
-            return
-
-        _, targets = split_command_and_args(event)
-        if not targets:
-            yield event.plain_result("⚠️ 请使用 /举报 @群友")
-            return
-
-        target_qq = targets[0]
-        reporter_qq = event.get_sender_id()
-        reporter_name = event.get_sender_name()
-
-        # 黑名单检查
-        s = self._load_settings()
-        if self._is_blacklisted(reporter_qq):
-            yield event.plain_result("🚫 你在投票黑名单中，无法发起举报")
-            return
-        if self._is_blacklisted(target_qq):
-            yield event.plain_result("🚫 目标用户在投票黑名单中，无法被举报")
-            return
-
-        if target_qq == reporter_qq:
-            yield event.plain_result("🤔 不能举报自己哦")
-            return
-
-        async with self._session_lock:
-            for v in self.active_sessions.values():
-                if v["group_id"] == group_id and v["target_qq"] == target_qq and v["state"] == "voting":
-                    yield event.plain_result(f"⏳ 针对 {v['target_name']} 的投票正在进行中")
-                    return
-
-        async with self._group_guard:
-            if group_id in self._busy_groups:
-                yield event.plain_result("⏳ 本群已有投票正在准备中，请稍后再试")
-                return
-            self._busy_groups.add(group_id)
-
-        try:
-            info = await self._call_api("get_group_member_info", group_id=int(group_id), user_id=int(target_qq))
-            if not info:
-                yield event.plain_result("❌ 无法获取被举报用户信息，请检查机器人权限或用户是否在群内")
-                return
-            target_name = (info.get("card") or info.get("nickname") if info else None) or f"QQ:{target_qq}"
-
-            reason = ""
-            if s["ask_reason"]:
-                timeout = s["reason_sec"]
-                yield event.plain_result(f"📝 请在一分钟内发送举报理由（超时自动取消）...")
-
-                @session_waiter(timeout=timeout, record_history_chains=False)
-                async def waiter(ctrl: SessionController, rev: AstrMessageEvent):
-                    nonlocal reason
-                    reason = pull_plain_text(rev)
-                    if not reason:
-                        await rev.send(rev.plain_result("⚠️ 举报理由不能为空，请重新发送"))
-                        ctrl.keep(timeout=timeout, reset_timeout=True)
-                        return
-                    ctrl.stop()
-
-                try:
-                    await waiter(event)
-                except TimeoutError:
-                    yield event.plain_result("⏰ 举报理由输入超时，已取消举报")
-                    return
-                except Exception as e:
-                    yield event.plain_result(f"❌ 发生错误: {e}")
-                    return
-
-                if not reason:
-                    yield event.plain_result("⚠️ 未获取到举报理由，已取消举报")
-                    return
-                yield event.plain_result(f"✅ 收到举报理由：{reason}")
-
-            logger.info(f"群 {group_id} {reporter_name} 举报 {target_name}" + (f"，理由：{reason}" if reason else ""))
-
-            yield event.plain_result(f"🔍 检测到 {reporter_name} 举报 {target_name}，正在搜索相关信息……")
-            eval_text = await self._evaluate_person(target_qq, target_name, str(group_id), event)
-            yield event.plain_result(eval_text)
-
-            vote_msg = await self._launch_vote(event, group_id, target_qq, target_name, reporter_name, s, reason)
-            yield event.plain_result(vote_msg)
-        finally:
-            async with self._group_guard:
-                self._busy_groups.discard(group_id)
-
-    # ========================================================================
-    # 查询指令
-    # ========================================================================
-
-    async def _find_current_vote(self, group_id: str) -> Optional[VoteSession]:
-        async with self._session_lock:
-            for v in self.active_sessions.values():
-                if v["group_id"] == group_id and v["state"] == "voting":
-                    return v
-            done = [v for v in self.finished_sessions.values() if v["group_id"] == group_id]
-            if done:
-                done.sort(key=lambda x: x.get("ended_at", 0), reverse=True)
-                return done[0]
-            return None
-
-    @filter.command("votestatus")
-    async def cmd_votestatus(self, event: AstrMessageEvent):
-        gid = event.message_obj.group_id
-        if not gid:
-            yield event.plain_result("❌ 该功能仅支持在群聊中使用")
-            return
-        sess = await self._find_current_vote(gid)
-        if not sess:
-            yield event.plain_result("📭 当前没有正在进行的投票，也没有最近结束的投票记录")
-            return
-        if sess["state"] == "voting":
-            left = max(0, sess["settings"]["vote_sec"] - int(time.time() - sess["started_at"]))
-            status = f"进行中，剩余 {left} 秒"
-        else:
-            status = "已结束"
-        reason_line = f"\n举报理由：{sess.get('reason', '无')}" if sess.get("reason") else ""
-        msg = f"""📊 **投票状态**
-
-被举报人：{sess['target_name']}
-举报人：{sess['reporter_name']}{reason_line}
-支持票：{sess['yes_cnt']}/{sess['required_votes']}
-反对票：{sess['no_cnt']}
-状态：{status}
-
-💬 发送 **支持** 或 **反对** 即可投票（仅进行中有效）"""
-        yield event.plain_result(msg)
-
-    @filter.command("voters")
-    async def cmd_voters(self, event: AstrMessageEvent):
-        gid = event.message_obj.group_id
-        if not gid:
-            yield event.plain_result("❌ 该功能仅支持在群聊中使用")
-            return
-        sess = await self._find_current_vote(gid)
-        if not sess:
-            yield event.plain_result("📭 当前没有正在进行的投票，也没有最近结束的投票记录")
-            return
-        yes_list = list(sess["yes_set"])
-        no_list = list(sess["no_set"])
-        status = "进行中" if sess["state"] == "voting" else "已结束"
-        lines = [f"📋 **投票群员名单** ({status})", f"针对：{sess['target_name']}"]
-        if sess.get("reason"):
-            lines.append(f"理由：{sess['reason']}")
-        lines.append(f"✅ 支持 ({len(yes_list)}人): " + (", ".join(yes_list) if yes_list else "暂无"))
-        lines.append(f"❌ 反对 ({len(no_list)}人): " + (", ".join(no_list) if no_list else "暂无"))
-        if sess["state"] == "voting":
-            lines.append(f"\n📊 当前票数: {sess['yes_cnt']}/{sess['required_votes']} (还需 {max(0, sess['required_votes'] - sess['yes_cnt'])} 票)")
-        else:
-            passed = sess["yes_cnt"] >= sess["required_votes"]
-            lines.append(f"\n📊 最终结果: {'✅ 通过' if passed else '❌ 未通过'} (支持 {sess['yes_cnt']}/{sess['required_votes']})")
-        yield event.plain_result("\n".join(lines))
-
-    # ========================================================================
-    # 管理员指令
-    # ========================================================================
-
-    @filter.command("setvote")
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def cmd_setvote(self, event: AstrMessageEvent, vote_sec: int, ban_min: int):
-        self.config["vote_duration"] = vote_sec
-        self.config["ban_duration"] = ban_min
-        self.config.save_config()
-        self._cached_settings = None
-        yield event.plain_result(f"✅ 投票时长已设为 {vote_sec} 秒，禁言时长 {ban_min} 分钟。")
-
-    @filter.command("getvote")
-    async def cmd_getvote(self, event: AstrMessageEvent):
-        s = self._load_settings()
-        gid = event.message_obj.group_id
-        need = await self._calc_needed_votes(str(gid)) if gid else s["fixed_votes"]
-        mode = "百分比模式" if s["percent_mode"] else "固定票数"
-        if s["percent_mode"]:
-            mode += f" ({s['percent_val']}%)"
-        msg = f"📋 当前配置：\n计算方式：{mode}\n投票时长：{s['vote_sec']} 秒\n禁言时长：{s['ban_min']} 分钟\n本群所需票数：{need} 票"
-        yield event.plain_result(msg)
-
-    @filter.command("ping")
-    async def cmd_ping(self, event: AstrMessageEvent):
-        yield event.plain_result("pong! 投票插件 v3.5.0 运行正常")
-
-    # ========================================================================
-    # 投票生命周期
+    # 投票生命周期（任务管理优化）
     # ========================================================================
 
     async def _launch_vote(self, event: AstrMessageEvent, group_id: str, target_qq: str,
@@ -733,7 +1077,10 @@ class VoteBanPlugin(Star):
         async with self._session_lock:
             self.active_sessions[key] = sess
 
-        asyncio.create_task(self._expire_vote(key, cfg["vote_sec"], group_id))
+        task = asyncio.create_task(self._expire_vote(key, cfg["vote_sec"], group_id))
+        async with self._session_lock:
+            self._vote_tasks[key] = task
+        task.add_done_callback(lambda t: asyncio.create_task(self._clean_vote_task(key)))
 
         act = "禁言" if cfg["action"] == "ban" else "踢出群聊"
         dur = f"{cfg['ban_min']} 分钟" if cfg["action"] == "ban" else "永久"
@@ -758,9 +1105,12 @@ class VoteBanPlugin(Star):
 📊 发送 **“查看投票进度”** 查看当前票数。
 👥 发送 **“查看投票群员”** 查看已投票成员名单。"""
 
+    async def _clean_vote_task(self, key: str):
+        async with self._session_lock:
+            self._vote_tasks.pop(key, None)
+
     async def _expire_vote(self, key: str, duration: int, group_id: str):
         s = self._load_settings()
-        # 倒计时提醒
         if s["enable_countdown"] and duration > s["countdown_sec"]:
             await asyncio.sleep(duration - s["countdown_sec"])
             async with self._session_lock:
@@ -791,8 +1141,7 @@ class VoteBanPlugin(Star):
             async for _ in self._do_action(None, key, sess):
                 pass
 
-        # 保存历史记录
-        self._save_vote_history(sess, passed)
+        await self._save_vote_history(sess, passed)
 
     async def _send_vote_result(self, sess: VoteSession, passed: bool):
         yes_list = list(sess["yes_set"])
@@ -816,7 +1165,6 @@ class VoteBanPlugin(Star):
         msg = "\n".join(lines)
         await self._send_group_text(sess["group_id"], msg)
 
-        # 自定义结束语
         if cfg.get("enable_closing_msg", False):
             closing = cfg.get("closing_msg", "").strip()
             if closing:
@@ -862,9 +1210,25 @@ class VoteBanPlugin(Star):
                     logger.info(f"清理了 {len(expired)} 个过期投票记录")
 
     async def terminate(self):
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+
         async with self._session_lock:
+            for task in list(self._vote_tasks.values()):
+                if not task.done():
+                    task.cancel()
+            for task in list(self._vote_tasks.values()):
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
             self.active_sessions.clear()
             self.finished_sessions.clear()
+
         if self._http and not self._http.closed:
             await self._http.close()
         logger.info("投票禁言插件已卸载")

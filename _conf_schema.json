@@ -194,5 +194,99 @@
         "type": "list",
         "hint": "黑名单内的用户不能发起举报，也不能被举报。每项为一个 QQ 号。",
         "default": []
+    },
+
+    "_group_filter_section": {
+        "description": "═══════════════ 🌐 分群启用配置 ═══════════════",
+        "type": "string",
+        "hint": "控制插件在哪些群生效，可开启白名单/黑名单模式",
+        "default": "--- 分群启用配置区 ---"
+    },
+    "enable_group_filter": {
+        "description": "启用分群过滤",
+        "type": "bool",
+        "hint": "开启后，根据白名单/黑名单限制生效群。关闭则所有群均生效。",
+        "default": false
+    },
+    "group_enabled_list": {
+        "description": "白名单群号列表",
+        "type": "list",
+        "hint": "仅这些群号的群启用插件。若为空且启用分群过滤，则只排除黑名单。",
+        "default": []
+    },
+    "group_disabled_list": {
+        "description": "黑名单群号列表",
+        "type": "list",
+        "hint": "这些群号的群禁用插件。白名单非空时黑名单无效。",
+        "default": []
+    },
+
+    "_super_admin_section": {
+        "description": "═══════════════ 👑 超级管理员配置 ═══════════════",
+        "type": "string",
+        "hint": "超级管理员可绕过投票直接执行管理操作",
+        "default": "--- 超级管理员配置区 ---"
+    },
+    "enable_super_admin": {
+        "description": "启用超级管理员",
+        "type": "bool",
+        "hint": "开启后，超级管理员可使用 /禁言、/踢人、/撤回 指令。",
+        "default": false
+    },
+    "super_admin_list": {
+        "description": "超级管理员 QQ 列表",
+        "type": "list",
+        "hint": "超级管理员的 QQ 号码列表（需要启用功能才生效）。",
+        "default": []
+    },
+
+    "_anti_spam_section": {
+        "description": "═══════════════ 🛡️ 防刷屏配置 ═══════════════",
+        "type": "string",
+        "hint": "根据上下文窗口检测重复消息，撤回多余旧消息",
+        "default": "--- 防刷屏配置区 ---"
+    },
+    "enable_anti_spam": {
+        "description": "启用防刷屏",
+        "type": "bool",
+        "hint": "开启后，在指定窗口内检测相同消息并自动撤回多余旧消息。",
+        "default": false
+    },
+    "spam_keep_count": {
+        "description": "保留消息条数",
+        "type": "int",
+        "hint": "同内容消息最多保留几条（默认1条），多余旧消息将被撤回。",
+        "default": 1
+    },
+    "spam_context_limit": {
+        "description": "上下文窗口大小（条）",
+        "type": "int",
+        "hint": "检测重复时，最多向前追溯多少条消息（默认100条）。",
+        "default": 100
+    },
+    "spam_min_duplicate": {
+        "description": "触发所需重复次数",
+        "type": "int",
+        "hint": "当窗口内相同消息出现次数达到该值时，才会执行处理（默认2次即一条重复）。",
+        "default": 2
+    },
+    "spam_action": {
+        "description": "附加处罚措施",
+        "type": "string",
+        "hint": "除撤回外，还可选择禁言或踢出用户（仅在检测到刷屏时执行）。",
+        "options": ["delete_msg", "ban", "kick"],
+        "default": "delete_msg"
+    },
+    "spam_rapid_ban_threshold": {
+        "description": "快速禁言触发次数",
+        "type": "int",
+        "hint": "同一用户相同内容出现次数达到该值，直接禁言（0为禁用此功能）。例如：15",
+        "default": 15
+    },
+    "spam_rapid_ban_duration": {
+        "description": "快速禁言时长（分钟）",
+        "type": "int",
+        "hint": "快速禁言的时长，单位分钟。例如：1",
+        "default": 1
     }
 }

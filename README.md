@@ -70,3 +70,11 @@ docker network inspect astrbot-napcat
 2. 2.具体目录应该就是AstrBot/data/plugins
 
 3. 3.解压好后重启容器就OK了
+
+## 安装好插件后
+### 需要在napcat中新建http网络
+![img_1.png](img_1.png)
+### 然后按照下图配置，Token是自动生成的，给它复制下来
+![img.png](img.png)
+### 打开插件配置，把复制的Token粘贴在相应位置即可
+![img_2.png](img_2.png)
