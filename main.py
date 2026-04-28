@@ -1,5 +1,5 @@
 """
-AstrBot 投票禁言插件 (astrbot_plugin_vote_ban)
+AstrBot 自助管理员插件 (astrbot_plugin_self_service_admin)
 版本：3.6.0 fix-final
 - 新增：任何群消息触发全群刷屏扫描，彻底清除残留
 - 新增：严重刷屏快速禁言阈值保护
@@ -153,7 +153,7 @@ class VoteSession(TypedDict):
 # 主插件类
 # ============================================================================
 
-@register("astrbot_plugin_vote_ban", "一枝茶狐吖", "投票禁言插件", "3.6.0")
+@register("astrbot_plugin_self_service_admin", "一枝茶狐吖", "自助管理员插件", "3.6.0")
 class VoteBanPlugin(Star):
 
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -199,7 +199,7 @@ class VoteBanPlugin(Star):
 
         self._check_critical_config()
 
-        logger.info("投票禁言插件 v3.6.0 (扫描增强版) 已加载")
+        logger.info("自助管理员插件 v3.6.0 (扫描增强版) 已加载")
 
     def _ensure_history_file(self):
         try:
@@ -1231,4 +1231,4 @@ class VoteBanPlugin(Star):
 
         if self._http and not self._http.closed:
             await self._http.close()
-        logger.info("投票禁言插件已卸载")
+        logger.info("自助管理员插件已卸载")
